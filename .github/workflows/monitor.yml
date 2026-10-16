@@ -25,9 +25,7 @@ jobs:
 
       - name: 运行监控脚本
         env:
-          QQ_MAIL: ${{ secrets.QQ_MAIL }}
-          QQ_AUTH_CODE: ${{ secrets.QQ_AUTH_CODE }}
-          QQ_MAIL_TO: ${{ secrets.QQ_MAIL_TO }}
+          SC_SENDKEY: ${{ secrets.SC_SENDKEY }}
         run: python monitor.py
 
       - name: 回写去重状态

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 监控 Tibo (@thsottiaux) 的推特，检测到「GPT 额度重置」类新推文时，
-立即通过 QQ 邮箱 SMTP 发送邮件通知。
+立即通过 Server酱 推送微信通知。
 
 设计要点：
 - 纯 Python 标准库实现，无需安装任何第三方库
@@ -9,19 +9,16 @@
     1. 直接抓 x.com 个人主页，解析内嵌 JSON 提取推文（在 GitHub 美服上最可靠）
     2. Nitter 实例的 RSS（免费镜像，部分可用）
     3. RSSHub 公共实例（社区镜像，部分可用）
-- 关键词命中才发邮件（避免他的闲聊也轰炸邮箱）
+- 关键词命中才推送微信（避免他的闲聊也轰炸通知）
 - 用 state.json 记录已见过的推文 ID，防止同一条推文重复发信
 - 运行所需配置全部来自环境变量（在 GitHub Secrets 中配置，不写死在代码里）
 """
 import os
 import re
 import json
-import ssl
 import html
-import smtplib
 import urllib.request
-from email.mime.text import MIMEText
-from email.header import Header
+import urllib.parse
 
 # 要监控的账号
 HANDLE = "thsottiaux"
@@ -151,23 +148,21 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-# ---------------- 邮件通知 ----------------
+# ---------------- 通知（Server酱 微信推送） ----------------
 
-def send_mail(theme, text):
-    """通过 QQ 邮箱 SMTP 发送邮件"""
-    sender = os.environ["QQ_MAIL"]          # 发件邮箱（QQ 邮箱地址）
-    auth = os.environ["QQ_AUTH_CODE"]       # QQ 邮箱授权码
-    to = os.environ.get("QQ_MAIL_TO", sender)  # 收件邮箱，默认同发件邮箱
-
-    msg = MIMEText(text, "plain", "utf-8")
-    msg["Subject"] = Header(theme, "utf-8")
-    msg["From"] = sender
-    msg["To"] = to
-
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.qq.com", 465, context=ctx, timeout=30) as server:
-        server.login(sender, auth)
-        server.sendmail(sender, [to], msg.as_string())
+def send_serverchan(theme, text):
+    """通过 Server酱 推送微信通知（无需邮箱/短信/授权码）"""
+    key = os.environ["SC_SENDKEY"]          # Server酱 SendKey（SCT 开头）
+    data = urllib.parse.urlencode({"title": theme, "desp": text}).encode()
+    req = urllib.request.Request(
+        "https://sctapi.ftqq.com/{}.send".format(key),
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read().decode("utf-8", "ignore"))
+    if result.get("code") != 0:
+        raise RuntimeError("Server酱推送失败: " + json.dumps(result, ensure_ascii=False))
 
 
 # ---------------- 主流程 ----------------
@@ -237,10 +232,10 @@ def main():
             lines.append("")
         body = "\n".join(lines)
         try:
-            send_mail("【GPT额度重置】Tibo 有新动作！", body)
-            print("已发送邮件，命中", len(new_hits), "条")
+            send_serverchan("【GPT额度重置】Tibo 有新动作！", body)
+            print("已推送微信通知，命中", len(new_hits), "条")
         except Exception as e:
-            print("错误：邮件发送失败 -", e)
+            print("错误：微信推送失败 -", e)
     else:
         print("本次未发现新的额度重置事件。")
 
