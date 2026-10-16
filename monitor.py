@@ -64,7 +64,7 @@ def extract_post_count(body):
     return None
 
 
-# ---------------- 通知（Server酱 微信推送） ----------------
+# ---------------- 通知（Server酱 微信推送 + 可选聚合短信） ----------------
 
 def send_serverchan(theme, text):
     """通过 Server酱 推送微信通知"""
@@ -79,6 +79,30 @@ def send_serverchan(theme, text):
         result = json.loads(resp.read().decode("utf-8", "ignore"))
     if result.get("code") != 0:
         raise RuntimeError("Server酱推送失败: " + json.dumps(result, ensure_ascii=False))
+
+
+def send_juhe_sms(last_count, count, now):
+    """通过聚合数据短信API发送运营商短信（可选通道，未配置则跳过）。
+    需要环境变量: JUHE_APPKEY / JUHE_TPL_ID / JUHE_MOBILE
+    模板中可用变量: #last# (原帖子数) / #count# (新帖子数)"""
+    appkey = os.environ.get("JUHE_APPKEY")
+    tpl = os.environ.get("JUHE_TPL_ID")
+    mobile = os.environ.get("JUHE_MOBILE")
+    if not (appkey and tpl and mobile):
+        print("未配置聚合短信，跳过运营商短信。")
+        return
+    tpl_value = urllib.parse.urlencode({"#last#": str(last_count), "#count#": str(count)})
+    url = ("http://v.juhe.cn/sms/send?mobile={0}&tpl_id={1}&tpl_value={2}&key={3}"
+           .format(mobile, tpl, tpl_value, appkey))
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            j = json.loads(resp.read().decode("utf-8", "ignore"))
+        if j.get("error_code") == 0:
+            print("已发送运营商短信通知。")
+        else:
+            print("警告：聚合短信发送失败 -", json.dumps(j, ensure_ascii=False))
+    except Exception as e:
+        print("警告：聚合短信调用异常 -", e)
 
 
 # ---------------- 状态持久化 ----------------
@@ -127,6 +151,7 @@ def main():
         try:
             send_serverchan("【GPT额度重置】Tibo 发新推了！", body)
             print("已推送微信通知：帖子数 {0} → {1}".format(last_count, count))
+            send_juhe_sms(last_count, count, now)
         except Exception as e:
             print("错误：微信推送失败 -", e)
     elif count < last_count:

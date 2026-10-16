@@ -26,6 +26,9 @@ jobs:
       - name: 运行监控脚本
         env:
           SC_SENDKEY: ${{ secrets.SC_SENDKEY }}
+          JUHE_APPKEY: ${{ secrets.JUHE_APPKEY }}
+          JUHE_TPL_ID: ${{ secrets.JUHE_TPL_ID }}
+          JUHE_MOBILE: ${{ secrets.JUHE_MOBILE }}
         run: python monitor.py
 
       - name: 回写去重状态
