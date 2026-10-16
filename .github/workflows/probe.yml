@@ -1,0 +1,20 @@
+name: 数据源探测
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for url in \
+            "https://cdn.syndication.twimg.com/timeline/profile?screen_name=thsottiaux&lang=en" \
+            "https://rsshub.app/twitter/user/thsottiaux" \
+            "https://rsshub.uneasy.win/twitter/user/thsottiaux" \
+            "https://r.jina.ai/https://x.com/thsottiaux" \
+            "https://twstalker.com/thsottiaux/rss" \
+            "https://x.com/thsottiaux" ; do
+            echo "===== $url ====="
+            curl -sL -o /tmp/out.txt -w "HTTP %{http_code} size %{size_download}" --connect-timeout 10 --max-time 25 "$url" || echo "CURL FAIL"
+            echo
+            head -c 200 /tmp/out.txt | tr '\n' ' ' ; echo; echo
+          done
