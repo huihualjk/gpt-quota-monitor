@@ -1,0 +1,39 @@
+name: 监控Tibo额度重置
+
+on:
+  schedule:
+    # 每 5 分钟检查一次（GitHub 免费层支持的最短间隔）
+    - cron: '*/5 * * * *'
+  # 允许在 GitHub 网页上手动触发一次（用来测试）
+  workflow_dispatch:
+
+# 允许把去重状态文件写回仓库
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 运行监控脚本
+        env:
+          QQ_MAIL: ${{ secrets.QQ_MAIL }}
+          QQ_AUTH_CODE: ${{ secrets.QQ_AUTH_CODE }}
+          QQ_MAIL_TO: ${{ secrets.QQ_MAIL_TO }}
+        run: python monitor.py
+
+      - name: 回写去重状态
+        run: |
+          git config user.name "monitor-bot"
+          git config user.email "monitor-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "更新监控状态 $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
