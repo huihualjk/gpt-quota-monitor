@@ -1,161 +1,77 @@
 # -*- coding: utf-8 -*-
 """
-监控 Tibo (@thsottiaux) 的推特，检测到「GPT 额度重置」类新推文时，
-立即通过 Server酱 推送微信通知。
+监控 Tibo (@thsottiaux) 的推特活动，检测到「新发帖」（他只会发 GPT 额度重置类推文）
+时，立即通过 Server酱 推送微信通知。
 
-设计要点：
-- 纯 Python 标准库实现，无需安装任何第三方库
-- 抓取策略（按顺序尝试，第一个成功就用它）：
-    1. 直接抓 x.com 个人主页，解析内嵌 JSON 提取推文（在 GitHub 美服上最可靠）
-    2. Nitter 实例的 RSS（免费镜像，部分可用）
-    3. RSSHub 公共实例（社区镜像，部分可用）
-- 关键词命中才推送微信（避免他的闲聊也轰炸通知）
-- 用 state.json 记录已见过的推文 ID，防止同一条推文重复发信
-- 运行所需配置全部来自环境变量（在 GitHub Secrets 中配置，不写死在代码里）
+原理：x.com 已对所有匿名访问关闭推文内容，但仍公开显示账号的「帖子总数」。
+Tibo 一旦发布新的额度重置推文，帖子数就会 +1。监控帖子数变化即可可靠捕获事件。
+数据源：r.jina.ai 网页代理（能从 GitHub 服务器抓取 x.com 页面并提取可见文本）。
 """
+
 import os
 import re
 import json
-import html
+import datetime
 import urllib.request
 import urllib.parse
 
-# 要监控的账号
-HANDLE = "thsottiaux"
-
-# 命中任一关键词即视为「额度重置」事件（中文在前，英文在后）
-KEYWORDS = ["重置", "额度", "reset", "quota", "credit", "credits", "token", "refresh"]
-
-# 策略 2：Nitter 实例 RSS（按顺序尝试）
-NITTER_SOURCES = [
-    "https://nitter.net/{}/rss",
-    "https://xcancel.com/{}/rss",
-    "https://nitter.poast.org/{}/rss",
-    "https://nitter.privacyredirect.com/{}/rss",
-    "https://nitter.catsarch.com/{}/rss",
-]
-
-# 策略 3：RSSHub 公共实例（按顺序尝试）
-RSSHUB_SOURCES = [
-    "https://rsshub.rssforever.com/twitter/user/{}",
-    "https://rsshub.pseudoyu.com/twitter/user/{}",
-]
-
 STATE_FILE = "state.json"
-MAX_KNOWN = 200  # state 里最多保留的推文 ID 数量
-FETCH_TIMEOUT = 15
-MAX_TWEETS = 20  # 每次最多解析多少条最新推文
+SCREEN_NAME = "thsottiaux"
+PROFILE_URL = "https://x.com/{0}".format(SCREEN_NAME)
 
+# ---------------- 抓取帖子数 ----------------
 
-def http_get(url, timeout=FETCH_TIMEOUT):
-    """抓取网页内容"""
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", "ignore")
-
-
-# ---------------- 策略 1：x.com 页面内嵌 JSON 解析 ----------------
-
-def walk_tweets(obj, out):
-    """递归遍历 x.com 内嵌 JSON，找出所有 Tweet 对象"""
-    if isinstance(obj, dict):
-        if obj.get("__typename") == "Tweet" and obj.get("rest_id") and obj.get("legacy"):
-            legacy = obj["legacy"]
-            out.append({
-                "id": obj["rest_id"],
-                "text": legacy.get("full_text", ""),
-                "created_at": legacy.get("created_at", ""),
-            })
-        for v in obj.values():
-            walk_tweets(v, out)
-    elif isinstance(obj, list):
-        for v in obj:
-            walk_tweets(v, out)
-
-
-def extract_from_xcom(html_text):
-    """从 x.com 个人主页 HTML 里提取推文列表"""
-    tweets = []
-    # 页面里有多段 type="application/json" 的内嵌数据
-    for block in re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', html_text, re.S):
+def fetch_post_count():
+    """从多个来源尝试获取 Tibo 的帖子总数，返回整数或 None。"""
+    sources = [
+        ("r.jina.ai", "https://r.jina.ai/https://x.com/{0}".format(SCREEN_NAME)),
+        ("x.com直连", "https://x.com/{0}".format(SCREEN_NAME)),
+    ]
+    for name, url in sources:
         try:
-            walk_tweets(json.loads(block), tweets)
-        except Exception:
-            continue
-    if not tweets:
-        # 兜底：直接正则抓 full_text + rest_id
-        for rest_id, full_text in re.findall(
-            r'"rest_id":"(\d{15,20})"[^}]{0,500}?"full_text":"((?:\\.|[^"\\])*)"', html_text
-        ):
-            tweets.append({"id": rest_id, "text": full_text, "created_at": ""})
-    # 去重 + 按时间倒序 + 限制条数
-    seen, uniq = set(), []
-    for t in tweets:
-        if t["id"] not in seen:
-            seen.add(t["id"])
-            uniq.append(t)
-    uniq.sort(key=lambda t: t["created_at"], reverse=True)
-    return uniq[:MAX_TWEETS]
-
-
-# ---------------- 策略 2/3：RSS 解析 ----------------
-
-def parse_rss_items(xml):
-    """极简 RSS 解析：提取每个 <item> 的标题、链接、时间"""
-    items = []
-    for m in re.finditer(r"<item>(.*?)</item>", xml, re.S):
-        block = m.group(1)
-        title = re.search(r"<title>(.*?)</title>", block, re.S)
-        link = re.search(r"<link>(.*?)</link>", block, re.S)
-        pub = re.search(r"<pubDate>(.*?)</pubDate>", block, re.S)
-        if title and link:
-            items.append({
-                "id": extract_tweet_id(html.unescape(link.group(1)).strip()),
-                "text": html.unescape(re.sub(r"<.*?>", "", title.group(1))).strip(),
-                "created_at": html.unescape(pub.group(1)).strip() if pub else "",
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
             })
-    return items
+            with urllib.request.urlopen(req, timeout=40) as resp:
+                body = resp.read().decode("utf-8", "ignore")
+
+            count = extract_post_count(body)
+            if count is not None:
+                print("[{0}] 解析到帖子数: {1}".format(name, count))
+                return count
+            print("[{0}] 抓到了页面但没解析到帖子数".format(name))
+        except Exception as e:
+            print("[{0}] 失败: {1}".format(name, e))
+    return None
 
 
-def extract_tweet_id(link):
-    """从推文链接里取出推文 ID（去重用）"""
-    tid = link.rstrip("/").split("/")[-1]
-    return tid.split("?")[0]
-
-
-# ---------------- 状态持久化 ----------------
-
-def load_state():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"last_ids": []}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+def extract_post_count(body):
+    """从页面文本中提取帖子总数。"""
+    patterns = [
+        r"([\d,]{1,12})\s*posts",
+        r"([\d,]{1,12})\s*推文",
+        r"([\d,]{1,12})\s*posts\b",
+    ]
+    for p in patterns:
+        m = re.search(p, body, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+    return None
 
 
 # ---------------- 通知（Server酱 微信推送） ----------------
 
 def send_serverchan(theme, text):
-    """通过 Server酱 推送微信通知（无需邮箱/短信/授权码）"""
-    key = os.environ["SC_SENDKEY"]          # Server酱 SendKey（SCT 开头）
+    """通过 Server酱 推送微信通知"""
+    key = os.environ["SC_SENDKEY"]
     data = urllib.parse.urlencode({"title": theme, "desp": text}).encode()
     req = urllib.request.Request(
-        "https://sctapi.ftqq.com/{}.send".format(key),
+        "https://sctapi.ftqq.com/{0}.send".format(key),
         data=data,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
@@ -165,84 +81,60 @@ def send_serverchan(theme, text):
         raise RuntimeError("Server酱推送失败: " + json.dumps(result, ensure_ascii=False))
 
 
+# ---------------- 状态持久化 ----------------
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
 # ---------------- 主流程 ----------------
 
-def fetch_tweets():
-    """按策略顺序抓取推文，返回 (数据源说明, 推文列表)"""
-    # 策略 1：x.com 个人主页
-    try:
-        html_text = http_get("https://x.com/{}".format(HANDLE))
-        tweets = extract_from_xcom(html_text)
-        if tweets:
-            return "x.com 直接抓取", tweets
-        print("[x.com] 抓到了页面但没解析出推文，换下一策略")
-    except Exception as e:
-        print("[x.com] 失败:", type(e).__name__, e)
-
-    # 策略 2：Nitter RSS
-    for tmpl in NITTER_SOURCES:
-        try:
-            items = parse_rss_items(http_get(tmpl.format(HANDLE)))
-            if items:
-                return "Nitter: " + tmpl, items
-        except Exception as e:
-            print("[Nitter]", tmpl, "失败:", type(e).__name__, e)
-
-    # 策略 3：RSSHub
-    for tmpl in RSSHUB_SOURCES:
-        try:
-            items = parse_rss_items(http_get(tmpl.format(HANDLE)))
-            if items:
-                return "RSSHub: " + tmpl, items
-        except Exception as e:
-            print("[RSSHub]", tmpl, "失败:", type(e).__name__, e)
-
-    return None, []
-
-
 def main():
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state = load_state()
-    known = set(state.get("last_ids", []))
-    source, tweets = fetch_tweets()
+    last_count = state.get("last_post_count")
 
-    print("数据源:", source or "全部失败")
-
-    if not tweets:
-        print("错误：所有数据源都不可用，本次无法检查。")
-        state["last_ids"] = []
-        save_state(state)
+    count = fetch_post_count()
+    if count is None:
+        print("数据源: 全部失败，本次无法检查。")
         return
 
-    new_hits = []
-    for t in tweets:
-        if t["id"] in known:
-            continue
-        text = (t["text"] or "").lower()
-        if any(k in text for k in KEYWORDS):
-            new_hits.append(t)
-        known.add(t["id"])
+    state["last_post_count"] = count
+    state["last_check"] = now
 
-    if new_hits:
-        lines = ["Tibo 发布了新的额度重置相关推文：", ""]
-        for h in new_hits:
-            lines.append("- 推文：" + h["text"])
-            lines.append("- 链接：https://x.com/{}/status/{}".format(HANDLE, h["id"]))
-            if h["created_at"]:
-                lines.append("- 时间：" + h["created_at"])
-            lines.append("")
-        body = "\n".join(lines)
+    if last_count is None:
+        print("首次运行：记录当前帖子数 {0}，之后有新帖会通知。".format(count))
+    elif count > last_count:
+        diff = count - last_count
+        body = (
+            "**Tibo 可能刚刚发布了新的额度重置推文！**\n\n"
+            "- 帖子数变化：{0} → {1}（新增 {2} 条）\n"
+            "- 检测时间：{3}\n\n"
+            "[点击立即查看 Tibo 主页]({4})\n\n"
+            "（提醒：Tibo 只发额度重置类推文，新帖大概率就是额度刷新）"
+        ).format(last_count, count, diff, now, PROFILE_URL)
         try:
-            send_serverchan("【GPT额度重置】Tibo 有新动作！", body)
-            print("已推送微信通知，命中", len(new_hits), "条")
+            send_serverchan("【GPT额度重置】Tibo 发新推了！", body)
+            print("已推送微信通知：帖子数 {0} → {1}".format(last_count, count))
         except Exception as e:
             print("错误：微信推送失败 -", e)
+    elif count < last_count:
+        print("警告：帖子数竟然减少了（{0} → {1}），可能被删帖或解析异常，已更新基准。".format(last_count, count))
     else:
-        print("本次未发现新的额度重置事件。")
+        print("帖子数无变化（{0}），本次未发现新的额度重置事件。".format(count))
 
-    # 更新去重状态（只保留最近的 ID，防止文件无限膨胀）
-    state["last_ids"] = list(known)[-MAX_KNOWN:]
     save_state(state)
-    print("状态已更新，共记录推文", len(state["last_ids"]), "条")
 
 
 if __name__ == "__main__":

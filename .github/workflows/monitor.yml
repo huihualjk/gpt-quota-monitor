@@ -2,8 +2,8 @@ name: 监控Tibo额度重置
 
 on:
   schedule:
-    # 每 5 分钟检查一次（GitHub 免费层支持的最短间隔）
-    - cron: '*/5 * * * *'
+    # 每 30 分钟检查一次（帖子数变化检测，足够及时且省额度）
+    - cron: '*/30 * * * *'
   # 允许在 GitHub 网页上手动触发一次（用来测试）
   workflow_dispatch:
 
